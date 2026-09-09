@@ -2,8 +2,9 @@
 //! the real svmbir of the `all_ct_reconstruction_development` pixi
 //! environment), and saving the parameters back into the checkpoint HDF5.
 
-use ct_reconstruction::combine::LoadedStack;
+use ct_reconstruction::combine::{LoadedStack, Projection};
 use ct_reconstruction::crop::{read_npy, write_npy};
+use ct_reconstruction::rebin::{rebin_center, rebin_projection, rebinned_size};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
@@ -19,6 +20,47 @@ pub const SVMBIR_LIB_PATHS: [&str; 3] = ["/fastdata/", "/SNS/VENUS/shared/fastda
 /// Slices reconstructed around each selected line (the Python
 /// `MARIMO_SVMBIR_TEST_RECONSTRUCTION_WIDTH`); the middle one is shown.
 pub const BAND: usize = 4;
+
+/// The n×n rebin factors the test reconstruction can run on (1 = the
+/// checkpoint's own resolution).
+pub const TEST_REBIN_FACTORS: [usize; 5] = [1, 2, 3, 4, 6];
+
+/// The center of rotation (px) a center offset stands for on
+/// `width`-pixel-wide projections — the inverse of the seeding rule
+/// `offset = -(width/2 - cor)` (integer half width, like the notebook).
+pub fn center_from_offset(offset: f64, width: usize) -> f64 {
+    (width / 2) as f64 + offset
+}
+
+/// The center offset that puts the center of rotation at `cor` on
+/// `width`-pixel-wide projections.
+pub fn offset_from_center(cor: f64, width: usize) -> f64 {
+    cor - (width / 2) as f64
+}
+
+/// The center offset for the n×n rebinned test data, given the offset on
+/// the checkpoint's `width`-pixel-wide projections: the center of rotation
+/// follows the pixel grid ([`rebin_center`]) and is re-expressed against
+/// the rebinned half width.
+pub fn rebinned_offset(offset: f64, width: usize, n: usize) -> f64 {
+    if n <= 1 {
+        return offset;
+    }
+    let cor = rebin_center(center_from_offset(offset, width), n);
+    let (rw, _) = rebinned_size(width, 1, n);
+    offset_from_center(cor, rw)
+}
+
+/// Largest n×n test-rebin factor that is useful for a stack of `height`
+/// rows: the band must still hold [`BAND`] rebinned slices.
+pub fn max_test_rebin(height: usize) -> usize {
+    TEST_REBIN_FACTORS
+        .iter()
+        .copied()
+        .filter(|n| BAND * n <= height.max(1))
+        .max()
+        .unwrap_or(1)
+}
 
 /// The SVMBIR parameters exposed by the marimo notebook, with its defaults
 /// and ranges.
@@ -169,11 +211,12 @@ impl ReconJob {
         top_slice: usize,
         bottom_slice: usize,
         params: SvmbirParams,
+        test_rebin: usize,
     ) -> Self {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             let started = std::time::Instant::now();
-            let result = run_recon(&stack, top_slice, bottom_slice, params)
+            let result = run_recon(&stack, top_slice, bottom_slice, params, test_rebin)
                 .map(|(w, top, bottom)| (w, top, bottom, started.elapsed().as_secs_f64()));
             let _ = tx.send(result);
         });
@@ -201,11 +244,50 @@ fn scratch_dir(stack: &LoadedStack) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// The rows of one projection feeding a test band around `line`: `BAND`
+/// rows at the checkpoint's resolution, `BAND × rebin` rows when the band
+/// is rebinned first (so it still holds `BAND` slices afterwards).
+fn band_rows(line: usize, height: usize, rebin: usize) -> (usize, usize) {
+    let rows = BAND * rebin.max(1);
+    let start = line
+        .saturating_sub(rows / 2)
+        .min(height.saturating_sub(rows));
+    (start, start + rows)
+}
+
+/// The two test bands of one projection, stacked (top band first), at the
+/// test resolution: cut out of the full projection and, for a rebin factor
+/// above 1, block-averaged n×n like the pre-processing rebin step.
+fn extract_bands(p: &Projection, bands: [(usize, usize); 2], rebin: usize) -> Vec<f32> {
+    let w = p.width;
+    let mut out = Vec::with_capacity(2 * BAND * w / rebin.max(1));
+    for (a, b) in bands {
+        let rows = &p.mean[a * w..b * w];
+        if rebin <= 1 {
+            out.extend_from_slice(rows);
+        } else {
+            let band = Projection {
+                name: String::new(),
+                run_number: None,
+                angle_deg: None,
+                n_images_used: 1,
+                height: b - a,
+                width: w,
+                mean: rows.to_vec(),
+                total_counts: 0.0,
+            };
+            out.extend_from_slice(&rebin_projection(&band, rebin).mean);
+        }
+    }
+    out
+}
+
 fn run_recon(
     stack: &LoadedStack,
     top_slice: usize,
     bottom_slice: usize,
     params: SvmbirParams,
+    test_rebin: usize,
 ) -> Result<(usize, Vec<f32>, Vec<f32>), String> {
     let first = stack
         .sample
@@ -219,14 +301,20 @@ fn run_recon(
         .collect::<Option<Vec<f64>>>()
         .ok_or("some projections carry no angle — the reconstruction needs all of them")?;
 
-    // One 4-slice band around each selected line; the middle slice is shown.
-    let band_range = |line: usize| -> (usize, usize) {
-        let half = BAND / 2;
-        let start = line.saturating_sub(half).min(h.saturating_sub(BAND));
-        (start, start + BAND)
-    };
-    let (top_a, top_b) = band_range(top_slice);
-    let (bottom_a, bottom_b) = band_range(bottom_slice);
+    // The test runs on n×n rebinned data when asked: smaller sinograms
+    // reconstruct much faster on the CPU. The parameters keep the
+    // checkpoint's pixel units; only the center offset is re-expressed for
+    // the rebinned width.
+    let rebin = test_rebin.clamp(1, max_test_rebin(h));
+    let (rw, _) = rebinned_size(w, h, rebin);
+    let mut test_params = params;
+    test_params.center_offset = rebinned_offset(params.center_offset, w, rebin);
+
+    // One BAND-slice band around each selected line; the middle slice is shown.
+    let bands = [
+        band_rows(top_slice, h, rebin),
+        band_rows(bottom_slice, h, rebin),
+    ];
 
     let dir = scratch_dir(stack)?;
     let sino_npy = dir.join("sino.npy");
@@ -240,14 +328,12 @@ fn run_recon(
         let _ = std::fs::remove_dir(&dir);
     };
     let run = || -> Result<(usize, Vec<f32>, Vec<f32>), String> {
-        // The two bands stacked into one (n, 2*BAND, w) volume.
-        let mut volume = Vec::with_capacity(n * 2 * BAND * w);
+        // The two bands stacked into one (n, 2*BAND, rw) volume.
+        let mut volume = Vec::with_capacity(n * 2 * BAND * rw);
         for p in &stack.sample {
-            for range in [(top_a, top_b), (bottom_a, bottom_b)] {
-                volume.extend_from_slice(&p.mean[range.0 * w..range.1 * w]);
-            }
+            volume.extend_from_slice(&extract_bands(p, bands, rebin));
         }
-        write_npy(&sino_npy, &[n, 2 * BAND, w], volume.chunks(2 * BAND * w))?;
+        write_npy(&sino_npy, &[n, 2 * BAND, rw], volume.chunks(2 * BAND * rw))?;
         let lib_path = SVMBIR_LIB_PATHS
             .iter()
             .find(|p| {
@@ -263,7 +349,7 @@ fn run_recon(
             "bands": [[0, BAND], [BAND, 2 * BAND]],
             "num_threads": std::thread::available_parallelism().map(|n| n.get().min(60)).unwrap_or(8),
             "lib_path": lib_path,
-            "params": serde_json::from_str::<serde_json::Value>(&params.to_json()).expect("params json"),
+            "params": serde_json::from_str::<serde_json::Value>(&test_params.to_json()).expect("params json"),
         });
         std::fs::write(&spec_file, spec.to_string())
             .map_err(|e| format!("write {}: {e}", spec_file.display()))?;
@@ -287,15 +373,57 @@ fn run_recon(
             ));
         }
         let (shape, values) = read_npy(&out_npy)?;
-        if shape != [2, w, w] {
-            return Err(format!("svmbir returned shape {shape:?}, expected (2, {w}, {w})"));
+        if shape != [2, rw, rw] {
+            return Err(format!("svmbir returned shape {shape:?}, expected (2, {rw}, {rw})"));
         }
-        let (top, bottom) = values.split_at(w * w);
-        Ok((w, top.to_vec(), bottom.to_vec()))
+        let (top, bottom) = values.split_at(rw * rw);
+        Ok((rw, top.to_vec(), bottom.to_vec()))
     };
     let result = run();
     cleanup();
     result
+}
+
+/// The standalone tilt & center-of-rotation tool's correction records in a
+/// stack's metadata: one JSON object per applied correction, oldest first.
+pub fn tilt_tool_records(metadata: &[(String, String)]) -> Vec<String> {
+    metadata
+        .iter()
+        .find(|(name, _)| name == "tilt_center_of_rotation")
+        .map(|(_, value)| {
+            value
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The checkpoint's geometry without loading the projections: its
+/// `/center_of_rotation` and the tilt tool's correction records. Used to
+/// tell whether the tool changed the file before reloading gigabytes.
+pub fn checkpoint_geometry(path: &Path) -> Result<(Option<f64>, Vec<String>), String> {
+    use hdf5_metno::types::VarLenUnicode;
+    let file = hdf5_metno::File::open(path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let cor = file
+        .dataset("center_of_rotation")
+        .and_then(|ds| ds.read_scalar::<f64>())
+        .ok();
+    let records = file
+        .group("metadata")
+        .and_then(|g| g.dataset("tilt_center_of_rotation"))
+        .and_then(|ds| ds.read_scalar::<VarLenUnicode>())
+        .map(|v| {
+            v.as_str()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((cor, records))
 }
 
 /// Write (or replace) the `svmbir_config` JSON in the checkpoint's
@@ -345,5 +473,66 @@ mod tests {
         let partial = SvmbirParams::from_json(r#"{"sharpness": 2.0}"#).unwrap();
         assert_eq!(partial.sharpness, 2.0);
         assert_eq!(partial.max_iterations, 20);
+    }
+
+    #[test]
+    fn offset_and_center_are_inverse() {
+        // The seeding rule: offset = -(width/2 - cor).
+        assert_eq!(offset_from_center(979.96, 2054), -(1027.0 - 979.96));
+        assert!((center_from_offset(offset_from_center(979.96, 2054), 2054) - 979.96).abs() < 1e-9);
+        // Odd widths use the integer half width, like the notebook.
+        assert_eq!(center_from_offset(0.0, 2055), 1027.0);
+    }
+
+    #[test]
+    fn rebinned_offset_follows_the_pixel_grid() {
+        // No rebin: unchanged.
+        assert_eq!(rebinned_offset(-3.5, 2054, 1), -3.5);
+        // The detector center stays the detector center of the rebinned
+        // image (4096 wide: cor 2047.5 -> 1023.5 at 2x2, offset -0.5 both).
+        let c = offset_from_center(2047.5, 4096);
+        assert!((rebinned_offset(c, 4096, 2) - offset_from_center(1023.5, 2048)).abs() < 1e-9);
+        // A general center: cor 979.96 on 2054 px -> (979.96+0.5)/2-0.5 on 1027 px.
+        let cor = 979.96;
+        let expected = offset_from_center((cor + 0.5) / 2.0 - 0.5, 1027);
+        assert!((rebinned_offset(offset_from_center(cor, 2054), 2054, 2) - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn band_rows_hold_band_slices_after_rebin() {
+        // 2x2: 8 rows around row 100 -> rebinned to 4 slices.
+        assert_eq!(band_rows(100, 2048, 2), (96, 104));
+        // Clamped at the edges.
+        assert_eq!(band_rows(0, 2048, 3), (0, 12));
+        assert_eq!(band_rows(2047, 2048, 1), (2044, 2048));
+        // Tiny stacks limit the useful factor.
+        assert_eq!(max_test_rebin(10), 2);
+        assert_eq!(max_test_rebin(3), 1);
+        assert_eq!(max_test_rebin(2048), 6);
+    }
+
+    #[test]
+    fn extract_bands_rebins_each_band() {
+        // 4 px wide, 8 rows: row r holds the value r everywhere.
+        let mut mean = Vec::new();
+        for r in 0..8 {
+            mean.extend(std::iter::repeat_n(r as f32, 4));
+        }
+        let p = Projection {
+            name: "p".into(),
+            run_number: None,
+            angle_deg: Some(0.0),
+            n_images_used: 1,
+            height: 8,
+            width: 4,
+            mean,
+            total_counts: 0.0,
+        };
+        // Full resolution: the rows verbatim.
+        let full = extract_bands(&p, [(0, 2), (6, 8)], 1);
+        assert_eq!(full, vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 6.0, 6.0, 6.0, 6.0, 7.0, 7.0, 7.0, 7.0]);
+        // 2x2: rows (0,1) -> 0.5, rows (2,3) -> 2.5; 2 px wide.
+        let reb = extract_bands(&p, [(0, 4), (4, 8)], 2);
+        assert_eq!(reb, vec![0.5, 0.5, 2.5, 2.5, 4.5, 4.5, 6.5, 6.5]);
     }
 }
