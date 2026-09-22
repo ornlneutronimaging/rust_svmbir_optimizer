@@ -824,24 +824,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ct_reconstruction"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "detector_orientation",
- "eframe",
- "egui",
- "egui_plot",
- "hdf5-metno",
- "image",
- "rayon",
- "rfd",
- "serde_json",
- "sha2",
- "tiff",
-]
-
-[[package]]
 name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2226,6 +2208,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "nectar"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "detector_orientation",
+ "eframe",
+ "egui",
+ "egui_plot",
+ "hdf5-metno",
+ "image",
+ "rayon",
+ "rfd",
+ "serde_json",
+ "sha2",
+ "tiff",
+]
+
+[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3451,11 +3451,11 @@ checksum = "6637bab7722d379c8b41ba849228d680cc12d0a45ba1fa2b48f2a30577a06731"
 name = "svmbir_optimizer"
 version = "0.1.0"
 dependencies = [
- "ct_reconstruction",
  "eframe",
  "egui",
  "hdf5-metno",
  "image",
+ "nectar",
  "rfd",
  "serde_json",
  "sha2",
