@@ -14,8 +14,31 @@ pub const SVMBIR_PYTHON: &str =
     "/SNS/VENUS/shared/software/git/all_ct_reconstruction_development/.pixi/envs/default/bin/python";
 
 /// svmbir's on-disk system-matrix cache locations, first writable one wins
-/// (same list as the Python configuration).
+/// (same list as the Python configuration and NeCTAR). Each user gets a
+/// subfolder of their own there (see `svmbir_user_cache`).
 pub const SVMBIR_LIB_PATHS: [&str; 3] = ["/fastdata/", "/SNS/VENUS/shared/fastdata/", "/tmp/"];
+
+/// The user's own svmbir cache folder under `base` (`<base>/<user>`, in
+/// which svmbir creates `sysmatrix`), created when missing and checked
+/// with a real probe write; `None` when `base` is not a folder or the
+/// user's folder cannot be made or written. One folder per user: a shared
+/// `sysmatrix` created by the first user without group write blocked
+/// everyone else (the permission bits of `base` said writable).
+pub fn svmbir_user_cache(base: &std::path::Path) -> Option<std::path::PathBuf> {
+    if !base.is_dir() {
+        return None;
+    }
+    let user = std::env::var("USER")
+        .ok()
+        .filter(|u| !u.is_empty() && !u.contains('/'))
+        .unwrap_or_else(|| "unknown_user".to_owned());
+    let dir = base.join(user);
+    std::fs::create_dir_all(&dir).ok()?;
+    let probe = dir.join(format!(".svmbir_write_probe_{}", std::process::id()));
+    let ok = std::fs::File::create(&probe).is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok.then_some(dir)
+}
 
 /// Slices reconstructed around each selected line (the Python
 /// `MARIMO_SVMBIR_TEST_RECONSTRUCTION_WIDTH`); the middle one is shown.
@@ -336,14 +359,8 @@ fn run_recon(
         write_npy(&sino_npy, &[n, 2 * BAND, rw], volume.chunks(2 * BAND * rw))?;
         let lib_path = SVMBIR_LIB_PATHS
             .iter()
-            .find(|p| {
-                let path = Path::new(p);
-                path.is_dir()
-                    && std::fs::metadata(path)
-                        .map(|m| !m.permissions().readonly())
-                        .unwrap_or(false)
-            })
-            .copied();
+            .find_map(|p| svmbir_user_cache(Path::new(p)))
+            .map(|dir| format!("{}/", dir.display()));
         let spec = serde_json::json!({
             "angles_rad": angles,
             "bands": [[0, BAND], [BAND, 2 * BAND]],
